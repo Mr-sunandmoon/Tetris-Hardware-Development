@@ -1,0 +1,16 @@
+# 临时文件
+~$*
+~WRL*.tmp
+*.tmp
+
+# Claude Code 配置
+.claude/
+
+# 编译产物
+*.o
+*.exe
+*.out
+
+# 系统文件
+Thumbs.db
+.DS_Store

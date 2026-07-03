@@ -1,0 +1,381 @@
+================================================================================
+        俄罗斯方块（Tetris）嵌入式项目 — 核心代码设计及必要注解说明
+        硬件平台：FS6818 开发板  |  作者：wzy、yy、lxy
+================================================================================
+
+一、系统架构
+================================================================================
+
+  三个并发线程通过全局变量通信：
+
+  ┌─────────────────┐    tetrisKey     ┌─────────────────┐
+  │  infrared 线程   │ ──────────────→ │   tetris 主线程   │
+  │  (红外遥控输入)   │                 │  (游戏逻辑+LED+音效)│
+  └─────────────────┘                 └────────┬────────┘
+                                        │ tetrisScore/Level
+                                        ↓
+                              ┌─────────────────┐
+                              │   score 线程      │
+                              │   (数码管显示)     │
+                              └─────────────────┘
+
+
+二、核心数据结构（global_variable.h）
+================================================================================
+
+// 方块结构体：4×4 矩阵描述形状，x/y 为在地图上的坐标
+typedef struct {
+    int x, y;
+    int shape[4][4];
+    int type;     // 0=I, 1=O, 2=T, 3=L, 4=J, 5=S, 6=Z
+    int rotate;   // 0~3 四种旋转形态
+} TetrisBlock;
+
+// 16×16 LED 点阵显存：每 2 字节对应一行 16 列
+// code[2*y] 存高 8 列，code[2*y+1] 存低 8 列
+struct led1616Data {
+    unsigned char code[33];
+};
+
+// 全局变量（线程间通信，每个变量只有一个写入者，无需锁）
+char tetrisKey;      // 红外→游戏：当前按键
+int  tetrisScore;    // 游戏→计分：分数
+int  tetrisLevel;    // 游戏→计分：难度
+int  tetrisSpeed;    // 由难度计算：speed = (10-level)*100ms
+
+
+三、游戏主逻辑（tetris.c）
+================================================================================
+
+3.1 七种方块的旋转矩阵
+--------------------------------------------------------------------------------
+// blockShapes[类型][旋转][行][列]  — 7种×4旋转×4×4
+int blockShapes[7][4][4][4] = {
+    // I型: 横 ████  竖 █
+    // O型: ██  (四种旋转相同)
+    //       ██
+    // T型, L型, J型, S型, Z型 ...  共 7×4×16 = 448 个预定义数据
+};
+
+3.2 开场动画：LED 点阵滚动 "TETRIS"
+--------------------------------------------------------------------------------
+/*
+ * 用 16 字节纵向字模（上下各空 4 行居中），在 16×16 LED 上滚动显示 5 个字母。
+ * 每 50ms 偏移一列，第 7 列留空做字间距，offset 到底后循环。
+ * 期间检测 tetrisKey，按下 1~9 立即退出进入游戏。
+ */
+static const unsigned char font_T[16] = {
+    0,0,0,0,                                    // 上空4行
+    0x7C,0x10,0x10,0x10,0x10,0x10,0x10,0x00,    // ■■■■■ + 竖柱
+    0,0,0,0
+};
+// font_E, font_R, font_I, font_S 同理（各 16 字节）
+
+void tetris_opening_animation() {
+    int offset = 0;
+    while (1) {
+        if (tetrisKey >= '1' && tetrisKey <= '9') break;  // 按键退出
+
+        // 遍历 16×16 视窗，按 offset 偏移量将 5 个字符渲染到点阵
+        for (y:0..15, x:0..15) {
+            int global_x = offset + x - 16;         // 文字从右滚入
+            if (global_x ∈ [0, 48)) {
+                int char_idx = global_x / 8;        // 第几个字符
+                int bit_idx  = 7 - (global_x % 8);  // 字模位序（高位在左）
+                if ((global_x % 8) < 7)             // 第7列为间距，跳过
+                    pixel = (font[char_idx][y] >> bit_idx) & 1;
+            }
+            // 映射到硬件坐标: real_x = 15 - x（水平镜像）
+            // real_x<8 → code[2*y+1];  real_x≥8 → code[2*y]
+        }
+        ioctl(dev_led1616_fd, LED_DISPLAY, &data);
+        usleep(50000);  offset++;
+        if (offset >= 80) offset = 0;  // 循环
+    }
+}
+
+3.3 游戏主循环
+--------------------------------------------------------------------------------
+void *tetris_thread(void *arg) {
+    // 1. 打开设备: LED点阵 + 蜂鸣器
+    // 2. 播放开场动画 → 截获难度键 1~9 → 计算 tetrisSpeed = (10-level)*100ms
+    // 3. 等待 OK 键 → 显示操作说明 → 初始化地图 + 随机生成首个方块
+
+    while (1) {
+        // ---- 按键处理 ----
+        if (tetrisKey != 0) {
+            // 在临时变量上试操作（L左/R右/D下/U旋转），碰撞检测通过才更新
+            if (!check_collision(tempBlock))
+                currentBlock = tempBlock;   // 移动成功
+            tetrisKey = 0;                  // 消费按键
+        }
+
+        // ---- 自动下落 ----
+        usleep(tetrisSpeed);
+        downBlock.y += 1;
+        if (check_collision(downBlock)) {
+            if (currentBlock.y < 0) { tetris_game_over(); return; }  // 顶部溢出
+            merge_block_to_map(currentBlock);          // 固定方块到地图
+            int lines = clear_full_lines();            // 消行
+            if (lines) {
+                tetrisScore += lines * 100;            // 加分
+                if (tetrisScore/1000 >= tetrisLevel && tetrisLevel < 9)
+                    { tetrisLevel++; tetrisSpeed = (10-tetrisLevel)*100000; }
+            }
+            currentBlock = create_block();             // 下一块
+        } else {
+            currentBlock = downBlock;                  // 继续下落
+        }
+        tetris_print();  // 刷新 LED
+    }
+}
+
+3.4 碰撞检测（核心算法）
+--------------------------------------------------------------------------------
+int check_collision(TetrisBlock block) {
+    for (i:0..3, j:0..3)
+        if (block.shape[i][j] == 1) {
+            int x = block.x + j, y = block.y + i;
+            if (x < 0 || x >= 16) return 1;   // 左右墙
+            if (y >= 16)         return 1;   // 底部
+            if (y >= 0 && gameMap[y][x] == 1) return 1;  // 与已固定方块重叠
+        }
+    return 0;  // 无碰撞
+}
+// 注意: y<0 不判碰撞，允许方块从顶部逐步落入
+
+3.5 消行算法（从底部向上扫描 + 回退检查）
+--------------------------------------------------------------------------------
+int clear_full_lines() {
+    for (i = 15; i >= 0; i--) {           // 从底部向上
+        if (第 i 行全为 1) {
+            for (k = i; k > 0; k--)        // 上方所有行整体下移
+                memcpy(gameMap[k], gameMap[k-1], 16*sizeof(int));
+            memset(gameMap[0], 0, ...);    // 顶部清零
+            i++;  // 回退：下移后当前行变为新内容，需重新检查
+        }
+    }
+}
+
+3.6 LED 渲染：将地图+方块写入点阵显存，通过 ioctl 刷新
+--------------------------------------------------------------------------------
+void tetris_print() {
+    memset(data.code, 0, 33);
+    // 遍历 gameMap[y][x]==1 的像素 + currentBlock 的 shape 像素
+    // 水平镜像: real_x = 15 - logic_x
+    // real_x < 8 → code[2*y+1] |= (1 << real_x)     (低8列)
+    // real_x ≥ 8 → code[2*y]   |= (1 << (real_x-8))  (高8列)
+    ioctl(dev_led1616_fd, LED_DISPLAY, &data);
+}
+
+3.7 游戏结束：五音旋律 + 画面闪烁 + 资源释放
+--------------------------------------------------------------------------------
+void tetris_game_over() {
+    pthread_cancel(id_score_thread);       // 停止计分
+    pthread_cancel(id_infrared_control_thread); // 停止红外
+    // G→A→F→D→低F 下行旋律 (880,698,587,494,349 Hz)，偶数拍画面闪烁
+    // 最后 close 设备 → raise(SIGINT) → ReleaseResource() 回收全部资源
+}
+
+
+四、红外遥控输入（infrared_control.c）
+================================================================================
+
+// 键值映射表：硬件码 → 逻辑字符
+key1_t table[] = {
+    {KEY_1,'1'},...{KEY_9,'9'},           // 数字→难度
+    {KEY_UP,'U'}, {KEY_DOWN,'D'},          // 方向→旋转/下落
+    {KEY_LEFT,'L'}, {KEY_RIGHT,'R'},       // 方向→移动
+    {KEY_ENTER,'O'},                        // OK→确认
+};
+
+void *infrared_control_thread(void *arg) {
+    dev_ir_fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK); // 非阻塞
+    while (1) {
+        ret = read(dev_ir_fd, &ev, sizeof(input_event));
+        if (ret <= 0) { usleep(2000); continue; }  // 无数据休眠2ms
+        if (ev.type == EV_KEY && ev.value == 1)     // 仅处理按下事件(去抖)
+            tetrisKey = 查表(ev.code);              // 写入全局变量
+    }
+}
+// 设计要点: O_NONBLOCK 非阻塞 + ev.value==1 天然去抖
+
+
+五、数码管显示（score.c）
+================================================================================
+
+void *score_thread(void *arg) {
+    char buf[8] = "00000000";
+    while (1) {
+        itoa(tetrisScore, buf, 10);       // 分数→前4字节
+        itoa(tetrisLevel, buf+4, 10);     // 难度→后4字节
+        ioctl(dev_zlg7290_fd, SET_VAL, buf);  // 刷新数码管
+        usleep(100000);                       // 100ms 周期
+    }
+}
+
+
+六、程序入口（main.c）
+================================================================================
+
+int main() {
+    start_interface1();  // 终端显示难度选择界面
+
+    pthread_create(红外线程);
+    pthread_create(计分线程);
+    pthread_create(游戏主线程);
+
+    signal(SIGINT, ReleaseResource);  // 注册 Ctrl+C / 异常退出处理
+
+    // 主线程阻塞等待子线程结束
+    pthread_join(红外线程);  pthread_join(计分线程);  pthread_join(游戏线程);
+}
+
+void ReleaseResource() {
+    pthread_cancel(所有线程);
+    close(所有设备fd：LED/数码管/红外/蜂鸣器);
+    exit(0);
+}
+
+
+七、关键设计总结
+================================================================================
+
+  多线程并发     — 三个线程各司其职，独立运行不阻塞
+  全局变量通信   — tetrisKey→游戏, tetrisScore/Level→计分，每变量单写入者无锁
+  非阻塞 I/O     — 红外 O_NONBLOCK + 2ms 轮询，不影响游戏性能
+  碰撞预检测     — 先对临时变量试操作，检测通过才更新，避免非法状态
+  消行回退       — clear_full_lines() 中 i++ 确保下移后的新行被重新检查
+  硬件抽象       — 红外键码表映射，游戏逻辑不依赖具体硬件键值
+  难度线性加速   — speed = (10-level)×100ms，等级1=900ms→等级9=100ms
+  信号安全退出   — SIGINT → 取消线程 + 关闭所有 fd，保证资源不泄漏
+
+
+八、遇到问题及解决方案
+================================================================================
+
+问题1: 红外按键抖动和重复触发
+  现象: 按一次遥控器按键，游戏响应多次，方块移动多格
+  原因: Linux input 子系统上报的事件包含"按下(value=1)"、
+        "长按重复(value=2)"和"释放(value=0)"三种
+  解决: 只处理 ev.type==EV_KEY && ev.value==1 的按下事件，
+        忽略重复和释放，天然去抖
+
+问题2: 红外 read() 阻塞导致游戏卡死
+  现象: 游戏画面卡住不动，直到按下遥控器按键才响应
+  原因: 默认 open() 为阻塞模式，read() 无数据时会一直等待
+  解决: 使用 open(DEV_IR, O_RDONLY | O_NONBLOCK) 非阻塞打开，
+        无数据时 read() 立即返回 -1，线程休眠 2ms 后重试
+
+问题3: 线程退出时设备资源未释放
+  现象: 程序 Ctrl+C 退出后，再次运行时 open 设备失败
+  原因: 直接 kill 线程不会自动 close 已打开的文件描述符
+  解决: 注册 SIGINT 信号处理函数 ReleaseResource()，
+        在其中 pthread_cancel 所有线程 + close 全部 fd，
+        游戏结束时间接触发 raise(SIGINT) 走统一清理流程
+
+问题4: LED 点阵显示画面左右镜像
+  现象: 方块在点阵上左右颠倒显示
+  原因: 16×16 LED 点阵模块的硬件列序与逻辑坐标相反
+  解决: 渲染时统一做水平镜像转换 real_x = (MAPWIDTH-1) - logic_x
+
+问题5: 消行时漏掉满行
+  现象: 一次消多行时，偶尔有满行未被消除
+  原因: 消除第 i 行后，上方行整体下移，原先的第 i-1 行内容
+        移到了第 i 行位置，但循环继续 i-- 跳过了它
+  解决: 消行后执行 i++ 回退一步，让循环重新检查当前位置的新行
+
+问题6: 新方块生成时立即碰撞
+  现象: 游戏有时刚生成方块就 Game Over
+  原因: 方块初始 y 坐标设为 -3（在地图顶部以上），逐渐落入时
+        如果顶部已被堆满，create_block() 后再下落一格就碰撞
+  解决: create_block() 将 y 初始化为 -3（而非 0），给顶部留出缓冲空间；
+        同时在 create_block() 之后立即做一次 check_collision()，
+        如果新方块在初始位置就碰撞，提前判定 Game Over
+
+问题7: 多线程共享全局变量数据竞争
+  现象: 偶发按键"丢失"，按下无反应
+  原因: 红外线程写入 tetrisKey 与游戏线程读取清零之间无同步机制
+  解决: 利用 tetrisKey 的单字节特性（char 类型读写是原子的），
+        且红外只写入非零值、游戏只清零，避免了读写冲突；
+        如需更健壮，可改用原子变量或加互斥锁
+
+问题8: 开场动画中按键检测延迟
+  现象: 选难度时按下遥控器按键，动画要过一会儿才退出
+  原因: 动画每帧 usleep(50000) + 渲染耗时近 55ms，一帧只检查一次按键
+  解决: 将按键检测放在每帧渲染的最开始位置，确保 50ms 内必然响应；
+        更优方案可用 select/poll 同时等待红外事件和超时
+
+
+九、收获与发现不足或有待提高的地方
+================================================================================
+
+【收获】
+
+1. 多线程编程实践
+   掌握了 pthread_create/pthread_join/pthread_cancel 的用法，
+   理解线程间通过全局变量通信的模式及其适用场景（单写入者无需锁）
+
+2. Linux 设备驱动接口
+   接触了三种典型的外设交互方式：
+   - ioctl: LED 点阵 (LED_DISPLAY)、数码管 (SET_VAL)
+   - read/input_event: 红外遥控器 (input 子系统)
+   - write/sysfs: PWM 蜂鸣器 ("频率,占空比"字符串控制)
+
+3. 交叉编译与嵌入式部署
+   使用 arm-none-linux-gnueabi-gcc 交叉编译工具链，
+   编写 Makefile 自动将产物部署到 /source/rootfs/ 目标板文件系统
+
+4. 实时游戏循环设计
+   理解了固定帧率（开场动画 20fps）与变速控制（游戏下落速度随难度变化）
+   的区别和实现方式
+
+5. 硬件抽象思维
+   通过键值映射表将硬件键码与游戏逻辑解耦，更换遥控器只需修改映射表
+
+6. 资源管理意识
+   信号处理 + 统一清理函数，确保异常退出时设备资源不泄漏
+
+【发现不足或有待提高的地方】
+
+1. 按键处理为单字符变量，无缓冲队列
+   当前 tetrisKey 一次只能存一个按键。如果玩家在游戏线程处理完之前
+   快速按下另一个键，第二个按键会覆盖第一个，造成"丢键"。
+   改进: 可使用环形缓冲区队列暂存按键序列
+
+2. 多处忙等待（busy-wait）
+   如 while(tetrisKey != 'O') usleep(10000) 等轮询等待，
+   虽然加了休眠但本质上仍是 CPU 空转。
+   改进: 使用条件变量(pthread_cond)或信号量，让线程真正阻塞等待
+
+3. 线程取消方式较为粗暴
+   tetris_game_over() 中直接 pthread_cancel 计分和红外线程，
+   被取消的线程没有机会做清理工作。
+   改进: 使用标志位(如 volatile int running=1)通知线程自行退出，
+       在线程内检查标志位并 return，资源由各线程自行释放
+
+4. 缺少暂停/恢复功能的完整实现
+   代码中提到 OK 键可暂停/继续，但主循环中未见明显的暂停逻辑
+   （仅有等待 OK 键开始的阶段）。暂停期间的画面保持、下落计时器
+   冻结等功能未体现。
+   改进: 增加 pause 状态变量，暂停时跳过下落逻辑但保持画面刷新
+
+5. 错误处理不够完善
+   设备 open 失败直接 return NULL，缺少重试或降级策略；
+   游戏中途设备异常断开无检测机制。
+   改进: 对关键 ioctl/read/write 返回值做检查，失败时尝试恢复或安全退出
+
+6. 自定义 itoa() 可替换
+   score.c 中手动实现了 itoa() 函数，而标准 C 库的 snprintf/sprintf
+   可直接完成整数转字符串。自定义实现增加了代码量和维护成本。
+   但考虑到嵌入式环境可能库不完整，此做法也可以理解。
+
+7. 魔数（Magic Number）较多
+   代码中存在如 80（滚动总列数）、48（字符总宽度）、-3（方块初始Y坐标）
+   等硬编码数字，缺乏命名常量，阅读和维护时需推导其含义。
+   改进: 定义命名常量如 #define SCROLL_TOTAL_COLS 80
+
+8. 可扩展性局限
+   当前游戏逻辑、LED 渲染、音效全耦合在一个 tetris_thread 中，
+   如果想增加新显示设备（如 LCD）或新音效方案，需要改动核心代码。
+   改进: 可将显示和音效抽象为独立接口，游戏逻辑只调用接口
